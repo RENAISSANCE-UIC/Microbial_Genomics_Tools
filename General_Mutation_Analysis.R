@@ -10,65 +10,91 @@ extract_gene_from_genbank <- function(gbk_file, gene_name, mutation_type = "poin
   
   cat("Searching for gene:", gene_name, "\n")
   
-  # Find the gene - try multiple search strategies
-  gene_patterns <- c(
-    paste0('/gene="', gene_name, '"'),
-    paste0('gene="', gene_name, '"'),
-    paste0('/locus_tag=".*', gene_name),
-    gene_name
-  )
+  # Find ALL occurrences of the gene name
+  gene_pattern <- paste0('/gene="', gene_name, '"')
+  gene_matches <- which(grepl(gene_pattern, gbk_lines))
   
-  gene_line <- NULL
-  for (pattern in gene_patterns) {
-    matches <- which(grepl(pattern, gbk_lines, ignore.case = TRUE))
-    if (length(matches) > 0) {
-      gene_line <- matches[1]
-      cat("Found gene using pattern:", pattern, "at line", gene_line, "\n")
-      break
-    }
-  }
-  
-  if (is.null(gene_line)) {
-    # Broader search
-    broad_matches <- which(grepl(gene_name, gbk_lines, ignore.case = TRUE))
-    if (length(broad_matches) > 0) {
-      cat("Gene not found with strict patterns. Potential matches at lines:\n")
-      for (i in 1:min(10, length(broad_matches))) {
-        cat("Line", broad_matches[i], ":", trimws(gbk_lines[broad_matches[i]]), "\n")
-      }
-      return(list(found = FALSE, matches = broad_matches))
-    }
+  if (length(gene_matches) == 0) {
     stop("Gene not found")
   }
   
-  # Extract gene information
-  gene_info <- extract_gene_details(gbk_lines, gene_line)
+  cat("Found", length(gene_matches), "potential matches for", gene_name, "\n")
   
-  return(list(
-    found = TRUE,
-    gene_info = gene_info,
-    gene_line = gene_line
-  ))
+  # For each match, extract the associated CDS information
+  candidates <- list()
+  
+  for (i in seq_along(gene_matches)) {
+    match_line <- gene_matches[i]
+    cat("Checking match", i, "at line", match_line, "\n")
+    
+    # Look backwards for the CDS or gene feature that contains this match
+    cds_line <- NULL
+    for (j in (match_line-1):max(1, match_line-20)) {
+      if (grepl("^\\s*CDS\\s+", gbk_lines[j]) || grepl("^\\s*gene\\s+", gbk_lines[j])) {
+        cds_line <- j
+        break
+      }
+    }
+    
+    if (!is.null(cds_line)) {
+      gene_info <- extract_gene_details(gbk_lines, cds_line, match_line)
+      gene_info$match_number <- i
+      gene_info$cds_line <- cds_line
+      gene_info$gene_line <- match_line
+      candidates[[i]] <- gene_info
+      
+      # Print candidate info
+      cat("  Candidate", i, ":\n")
+      cat("    Product:", gene_info$product, "\n")
+      cat("    Length:", gene_info$coordinates$length_aa, "aa\n")
+      cat("    Location:", gene_info$coordinates$start, "-", gene_info$coordinates$end, "\n\n")
+    }
+  }
+  
+  # If multiple candidates, try to pick the right one
+  if (length(candidates) > 1) {
+    cat("Multiple candidates found. Attempting to select the correct one...\n")
+    
+    # For cusS, we expect ~481 amino acids and "sensor histidine kinase" in product
+    if (gene_name == "cusS") {
+      for (candidate in candidates) {
+        if (!is.null(candidate$product) && 
+            grepl("sensor.*histidine.*kinase", candidate$product, ignore.case = TRUE) &&
+            candidate$coordinates$length_aa > 400) {
+          cat("Selected candidate based on product description and length\n")
+          return(list(found = TRUE, gene_info = candidate))
+        }
+      }
+    }
+    
+    # If no specific logic, ask user or pick the longest
+    cat("Using longest candidate as default\n")
+    lengths <- sapply(candidates, function(x) x$coordinates$length_aa)
+    selected <- candidates[[which.max(lengths)]]
+    return(list(found = TRUE, gene_info = selected))
+  }
+  
+  return(list(found = TRUE, gene_info = candidates[[1]]))
 }
 
 # Extract detailed gene information
-extract_gene_details <- function(gbk_lines, start_line) {
+extract_gene_details <- function(gbk_lines, cds_line, gene_line) {
   info <- list()
   
-  # Look backwards and forwards for CDS/gene features
-  search_range <- max(1, start_line - 50):min(length(gbk_lines), start_line + 100)
+  # Extract coordinates from CDS line
+  coords <- extract_coordinates(gbk_lines[cds_line])
+  info$coordinates <- coords
+  info$strand <- coords$strand
   
-  # Extract coordinates
-  for (i in search_range) {
+  # Look forward from gene_line for associated information
+  search_end <- min(length(gbk_lines), gene_line + 50)
+  
+  for (i in gene_line:search_end) {
     line <- gbk_lines[i]
     
-    # Look for CDS coordinates
-    if (grepl("^\\s*CDS\\s+", line)) {
-      coords <- extract_coordinates(line)
-      if (!is.null(coords)) {
-        info$coordinates <- coords
-        info$strand <- coords$strand
-      }
+    # Stop if we hit another gene/CDS
+    if (i > gene_line && (grepl("^\\s*gene\\s+", line) || grepl("^\\s*CDS\\s+", line))) {
+      break
     }
     
     # Extract gene name
@@ -76,23 +102,39 @@ extract_gene_details <- function(gbk_lines, start_line) {
       info$gene_name <- gsub('.*\\/gene="([^"]*)".*', '\\1', line)
     }
     
-    # Extract product
-    if (grepl('/product=', line)) {
-      product_line <- line
-      j <- i
-      # Handle multi-line products
-      while (j <= length(gbk_lines) && !grepl('".*"', product_line)) {
-        j <- j + 1
-        if (j <= length(gbk_lines)) {
-          product_line <- paste(product_line, gbk_lines[j])
-        }
-      }
-      info$product <- gsub('.*\\/product="([^"]*)".*', '\\1', product_line)
+    # Extract locus tag
+    if (grepl('/locus_tag=', line)) {
+      info$locus_tag <- gsub('.*\\/locus_tag="([^"]*)".*', '\\1', line)
     }
     
-    # Extract translation if available
+    # Extract product - handle multi-line
+    if (grepl('/product=', line)) {
+      product_text <- line
+      j <- i
+      
+      # If product doesn't end on same line, keep reading
+      if (!grepl('/product="[^"]*"', line)) {
+        while (j < search_end && !grepl('"\\s*$', gbk_lines[j])) {
+          j <- j + 1
+          product_text <- paste(product_text, gbk_lines[j])
+        }
+      }
+      
+      # Extract product text
+      product_match <- regmatches(product_text, regexpr('/product="[^"]*"', product_text))
+      if (length(product_match) > 0) {
+        info$product <- gsub('/product="([^"]*)"', '\\1', product_match)
+      }
+    }
+    
+    # Extract translation - handle multi-line
     if (grepl('/translation=', line)) {
       info$translation <- extract_translation(gbk_lines, i)
+    }
+    
+    # Extract protein ID
+    if (grepl('/protein_id=', line)) {
+      info$protein_id <- gsub('.*\\/protein_id="([^"]*)".*', '\\1', line)
     }
   }
   
