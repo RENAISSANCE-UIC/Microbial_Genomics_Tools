@@ -591,8 +591,14 @@ write_cds_table <- function(gbk_list, file) {
   invisible(file)
 }
 
-
-
+# Helper function for reverse complement
+reverse_complement <- function(seq) {
+  seq <- toupper(seq)
+  complement_map <- c("A"="T", "T"="A", "G"="C", "C"="G", "N"="N")
+  rev_seq <- rev(strsplit(seq, "")[[1]])
+  comp_seq <- complement_map[rev_seq]
+  paste(comp_seq, collapse="")
+}
 
 # ==== Using parser ====
 ex <- '
